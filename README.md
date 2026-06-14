@@ -3,7 +3,7 @@
 **Give your AI coding agent persistent memory across sessions.** Stop losing context every time you close the terminal. This is a complete, production-ready infrastructure for [opencode-mem](https://github.com/Stranmor/opencode-mem) — a Rust MCP server that gives OpenCode, Claude Code, Codex CLI, and any MCP-compatible agent durable, searchable memory backed by PostgreSQL + pgvector.
 
 Built for developers who want:
-- **Zero cloud dependency** — embeddings run locally via ONNX (BGE-M3, multilingual)
+- **Zero cloud dependency** — embeddings run locally via ONNX (BGE-M3, multilingual), or optionally via Cohere API
 - **Free LLM compression** — dedup and summarization via OpenRouter free tier (or OpenCode Zen)
 - **Docker-first** — single `docker compose up` to start
 - **Privacy** — your data never leaves your machine (embedding) or is routed through providers with zero-retention policies (compression)
@@ -40,7 +40,7 @@ This infrastructure solves that. It gives your agent a durable, searchable memor
 
 - **PostgreSQL 16** with `pgvector` extension – stores observations, sessions, embeddings
 - **opencode-mem** – MCP server that connects to PG, provides 18 memory tools
-- **BGE-M3 embeddings** – runs locally via ONNX (CPU), no GPU needed
+- **BGE-M3 embeddings** – runs locally via ONNX (CPU, requires AVX2), or via Cohere API (no CPU requirement, free trial)
 - **LLM compression** – uses a remote API (OpenRouter/OpenCode Zen) for dedup + summarization
 
 ---
@@ -122,59 +122,22 @@ sudo apt-get update
 sudo apt-get install -y build-essential pkg-config libssl-dev
 ```
 
-### 2.3 Clone and build
+### 2.3 Build from this repo (includes fixes + API embedding support)
 
 ```bash
-git clone https://github.com/Stranmor/opencode-mem.git
-cd opencode-mem
+cd source
 cargo build --release
 ```
 
-The binary will be at `target/release/opencode-mem`. Copy it to your PATH:
+The binary will be at `source/target/release/opencode-mem`. Copy it to your PATH:
 
 ```bash
 cp target/release/opencode-mem ~/.local/bin/opencode-mem-cli
 ```
 
-### ⚠️ Known build error: function signature mismatch
+### ⚠️ Note: function signature fix already applied
 
-You may encounter this error when building:
-
-```
-error[E0061]: this function takes 5 arguments but 4 arguments were supplied
-   --> crates/llm/src/observation.rs:171:13
-    |
-171 |             build_compression_prompt(&input.tool, &filtered_title, &filtered_output, candidates);
-    |             ^^^^^^^^^^^^^^^^^^^^^^^^------------------------------------------------------------ argument #5 of type `&str` is missing
-```
-
-**Cause:** The `build_compression_prompt` function expects a 5th argument `current_session_id: &str`, but the caller at `observation.rs:171` only passes 4 arguments.
-
-**Fix:** Edit `crates/llm/src/observation.rs` and change lines 170-171 from:
-
-```rust
-        let prompt =
-            build_compression_prompt(&input.tool, &filtered_title, &filtered_output, candidates);
-```
-
-To:
-
-```rust
-        let prompt =
-            build_compression_prompt(
-                &input.tool,
-                &filtered_title,
-                &filtered_output,
-                candidates,
-                input.session_id.as_ref(),
-            );
-```
-
-Then rebuild:
-
-```bash
-cargo build --release
-```
+The `source/` directory in this repo already includes the fix for `build_compression_prompt` (5th argument `session_id`). If building from the upstream repo, see the troubleshooting section below.
 
 ---
 
@@ -311,6 +274,8 @@ These calls are handled automatically if you add instructions to your `.opencode
 | `OPENCODE_MEM_API_URL` | No | `https://api.openai.com` | OpenAI-compatible base URL |
 | `OPENCODE_MEM_MODEL` | No | — | Model for compression |
 | `OPENCODE_MEM_DISABLE_EMBEDDINGS` | No | `false` | Disable vector embeddings |
+| `OPENCODE_MEM_EMBEDDINGS_API_KEY` | No | — | API key for remote embeddings (Cohere/OpenAI-compatible). When set, overrides local ONNX |
+| `OPENCODE_MEM_EMBEDDINGS_API_URL` | No | `https://api.cohere.com/v1/embed` | URL for remote embedding API (Cohere-compatible format) |
 | `OPENCODE_MEM_MAX_RETRY` | No | `3` | LLM compression retries |
 | `OPENCODE_MEM_VISIBILITY_TIMEOUT` | No | `300s` | Queue visibility timeout |
 | `OPENCODE_MEM_DEDUP_THRESHOLD` | No | `0.85` | Cosine similarity for dedup |
@@ -337,7 +302,16 @@ docker inspect --format='{{.State.Health.Status}}' opencode-mem-pg
 
 ### Embeddings fail to load
 
-BGE-M3 (~1.3 GB) downloads on first use. Ensure your machine has enough disk space and a working internet connection. The model is cached after first download.
+**If using local ONNX (BGE-M3):** The model (~1.3 GB) downloads on first use. Ensure enough disk space and internet. BGE-M3 requires AVX2 CPU support — older CPUs (e.g., Sandy Bridge i7-2630QM) will crash with `Illegal instruction`.
+
+**Solution:** Use the **Cohere API** embedding provider instead. Set `OPENCODE_MEM_EMBEDDINGS_API_KEY` to a free Cohere trial key (no credit card needed, sign up at [cohere.com](https://cohere.com)):
+
+```env
+OPENCODE_MEM_EMBEDDINGS_API_KEY=your-cohere-trial-key
+OPENCODE_MEM_EMBEDDINGS_API_URL=https://api.cohere.com/v1/embed  # default
+```
+
+The API provider uses `embed-multilingual-v3.0` (1024-dim, matching pgvector schema).
 
 ### Rate limited by OpenRouter free tier
 
@@ -381,7 +355,13 @@ OPENCODE_MEM_MODEL=qwen2.5:3b
 
 ### What hardware do I need?
 
-- **CPU:** Any x86_64 (BGE-M3 embeddings run on CPU via ONNX, ~1-2 GB RAM)
+**With Cohere API embeddings (recommended):**
+- **CPU:** Any x86_64
+- **RAM:** 2+ GB
+- **Disk:** ~100 MB (binary + database)
+
+**With local ONNX (BGE-M3):**
+- **CPU:** x86_64 with AVX2 support (check with `lscpu | grep avx2`). Older CPUs (Sandy Bridge, Ivy Bridge) will crash.
 - **RAM:** 4+ GB for PostgreSQL + opencode-mem
 - **Disk:** ~2 GB for the binary + embedding model + database
 - **GPU:** Not required (but supported if available)
