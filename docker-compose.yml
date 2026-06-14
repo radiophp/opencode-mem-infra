@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: opencode-mem-pg
+    restart: unless-stopped
+    ports:
+      - "${POSTGRES_PORT:-4004}:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-opencode_mem}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-opencode_mem}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-opencode_mem} -d ${POSTGRES_DB:-opencode_mem}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
