@@ -1,8 +1,26 @@
 # opencode-mem Infrastructure
 
-Persistent, semantic memory for AI coding agents via [opencode-mem](https://github.com/Stranmor/opencode-mem) – a Rust MCP server backed by PostgreSQL + pgvector.
+**Give your AI coding agent persistent memory across sessions.** Stop losing context every time you close the terminal. This is a complete, production-ready infrastructure for [opencode-mem](https://github.com/Stranmor/opencode-mem) — a Rust MCP server that gives OpenCode, Claude Code, Codex CLI, and any MCP-compatible agent durable, searchable memory backed by PostgreSQL + pgvector.
 
-This setup gives your AI agents long-term memory across sessions: store observations, search semantically, auto-summarize work, and recall past decisions.
+Built for developers who want:
+- **Zero cloud dependency** — embeddings run locally via ONNX (BGE-M3, multilingual)
+- **Free LLM compression** — dedup and summarization via OpenRouter free tier (or OpenCode Zen)
+- **Docker-first** — single `docker compose up` to start
+- **Privacy** — your data never leaves your machine (embedding) or is routed through providers with zero-retention policies (compression)
+
+**Keywords:** opencode memory, MCP server, persistent memory, AI agent memory, pgvector, semantic search, PostgreSQL vector database, Rust MCP, coding agent context, OpenCode MCP server, LLM memory, cross-session context, AI coding assistant memory, opencode-mem setup, Claude Code memory, Codex CLI memory
+
+---
+
+## Why This Exists
+
+AI coding agents forget everything between sessions. Every time you start a new terminal, your agent has no memory of:
+- What you worked on yesterday
+- Decisions you made about architecture
+- Gotchas you discovered
+- Project conventions you established
+
+This infrastructure solves that. It gives your agent a durable, searchable memory — facts are stored by *meaning* (vector embeddings), not just keywords, and can be recalled across any session, any project, any CLI.
 
 ---
 
@@ -132,7 +150,7 @@ error[E0061]: this function takes 5 arguments but 4 arguments were supplied
 
 **Cause:** The `build_compression_prompt` function expects a 5th argument `current_session_id: &str`, but the caller at `observation.rs:171` only passes 4 arguments.
 
-**Fix:** Edit `crates/llm/src/observation.rs` and change line 170-171 from:
+**Fix:** Edit `crates/llm/src/observation.rs` and change lines 170-171 from:
 
 ```rust
         let prompt =
@@ -324,3 +342,74 @@ BGE-M3 (~1.3 GB) downloads on first use. Ensure your machine has enough disk spa
 ### Rate limited by OpenRouter free tier
 
 Swap to OpenCode Zen or a paid model like `deepseek/deepseek-chat` ($0.14/$0.28 per 1M tokens).
+
+---
+
+## FAQ
+
+### Why does my AI agent forget everything between sessions?
+
+This is the fundamental limitation of all AI coding tools. Each session is isolated — the agent has no built-in way to persist what it learned. opencode-mem solves this by storing observations in PostgreSQL and retrieving them via semantic search across sessions.
+
+### Is this only for OpenCode?
+
+No. opencode-mem is an MCP server — it works with any MCP-compatible client: **OpenCode**, **Claude Code**, **Codex CLI**, and any other tool that supports the Model Context Protocol. The setup guide above shows OpenCode config, but the same binary works for all of them.
+
+### Does this work without internet?
+
+**Partially.** The BGE-M3 embeddings run 100% locally via ONNX (no internet needed). The LLM compression step (dedup, summarization, metadata extraction) needs an API endpoint — either remote (OpenRouter, OpenCode Zen) or local (Ollama). You can disable compression entirely and still have full search and storage.
+
+### What's the cheapest way to run this?
+
+**Free.** The primary config uses OpenRouter's free tier (`qwen/qwen3-coder:free`) — no credit card required. Embeddings run locally at no cost. The only paid option would be if you exceed OpenRouter's free tier limits (~200 req/day), in which case you'd pay pennies for a fallback model.
+
+### How is my data handled?
+
+- **Embeddings:** Your data never leaves your machine (local ONNX runtime)
+- **LLM compression:** Routed through OpenRouter or OpenCode Zen with zero-retention policies
+- **Database:** Your own PostgreSQL, fully under your control
+
+### Can I use a local LLM instead of a cloud API?
+
+Yes. Point `OPENCODE_MEM_API_URL` at any OpenAI-compatible local server (Ollama, llama.cpp, LM Studio):
+
+```env
+OPENCODE_MEM_API_URL=http://localhost:11434/v1
+OPENCODE_MEM_API_KEY=ollama  # Ollama accepts any key
+OPENCODE_MEM_MODEL=qwen2.5:3b
+```
+
+### What hardware do I need?
+
+- **CPU:** Any x86_64 (BGE-M3 embeddings run on CPU via ONNX, ~1-2 GB RAM)
+- **RAM:** 4+ GB for PostgreSQL + opencode-mem
+- **Disk:** ~2 GB for the binary + embedding model + database
+- **GPU:** Not required (but supported if available)
+
+### What is the function signature error when building?
+
+See [Step 2.3](#-known-build-error-function-signature-mismatch) above. The upstream repo has a minor mismatch between a function definition and its caller. The fix is a one-line addition — edit the file, add the 5th argument, and rebuild.
+
+### What models support Persian / Arabic / non-Latin text?
+
+BGE-M3 (the default embedding model) supports 100+ languages including Persian, Arabic, Chinese, Japanese, and Korean. For the compression LLM, Qwen3 Coder and DeepSeek have strong multilingual support.
+
+### Can I use this across multiple projects?
+
+Yes. opencode-mem supports a global store (cross-project facts, preferences) accessible from any project directory. You can scope searches to current or all projects.
+
+### What happens if PostgreSQL goes down?
+
+opencode-mem has a built-in circuit breaker. It gracefully degrades when PostgreSQL is unavailable and automatically recovers on reconnect. No data loss, no crash.
+
+### How do I back up my memory data?
+
+Your PostgreSQL data volume persists across container restarts. To back up:
+
+```bash
+docker exec opencode-mem-pg pg_dump -U opencode_mem opencode_mem > backup.sql
+```
+
+### How is this different from .opencode/instructions or AGENTS.md?
+
+`.opencode/instructions` and `AGENTS.md` are static text files loaded into every session's prompt. They're good for project-level conventions but can't scale to session-by-session observations. opencode-mem is a dynamic database — it stores facts from every session, retrieves them by semantic meaning, and auto-compresses them into summaries.
