@@ -1,0 +1,494 @@
+//! ObservationStore implementation for PgStorage.
+
+use super::*;
+
+use crate::error::StorageError;
+use crate::traits::ObservationStore;
+use async_trait::async_trait;
+use opencode_mem_core::{Observation, ObservationMetadata, SearchResult};
+
+impl PgStorage {
+    async fn update_observation_fields(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        id: &str,
+        merged: &opencode_mem_core::MergeResult,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE observations SET facts = $1, keywords = $2, files_read = $3,
+                    files_modified = $4, narrative = $5, created_at = $6, concepts = $7,
+                    noise_level = $8, subtitle = $9, noise_reason = $10,
+                    prompt_number = $11, discovery_tokens = $12, title = $14, observation_type = $15
+               WHERE id = $13",
+        )
+        .bind(serde_json::to_value(&merged.facts)?)
+        .bind(serde_json::to_value(&merged.keywords)?)
+        .bind(serde_json::to_value(&merged.files_read)?)
+        .bind(serde_json::to_value(&merged.files_modified)?)
+        .bind(&merged.narrative)
+        .bind(merged.created_at)
+        .bind(serde_json::to_value(&merged.concepts)?)
+        .bind(merged.noise_level.as_str())
+        .bind(&merged.subtitle)
+        .bind(&merged.noise_reason)
+        .bind(
+            merged
+                .prompt_number
+                .map(|v| v.as_pg_i32())
+                .transpose()
+                .map_err(|e| StorageError::DataCorruption {
+                    context: "prompt_number exceeds i32::MAX".into(),
+                    source: Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()),
+                })?,
+        )
+        .bind(
+            merged
+                .discovery_tokens
+                .map(|v| v.as_pg_i32())
+                .transpose()
+                .map_err(|e| StorageError::DataCorruption {
+                    context: "discovery_tokens exceeds i32::MAX".into(),
+                    source: Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()),
+                })?,
+        )
+        .bind(id)
+        .bind(&merged.title)
+        .bind(merged.observation_type.as_str())
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ObservationStore for PgStorage {
+    async fn save_observation(&self, obs: &Observation) -> Result<bool, StorageError> {
+        let result = sqlx::query(
+            r#"INSERT INTO observations
+               (id, session_id, project, observation_type, title, subtitle, narrative,
+                facts, concepts, files_read, files_modified, keywords,
+                prompt_number, discovery_tokens, noise_level, noise_reason, created_at)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+               ON CONFLICT (id) DO NOTHING"#,
+        )
+        .bind(&obs.id)
+        .bind(&obs.session_id)
+        .bind(&obs.project)
+        .bind(obs.observation_type.as_str())
+        .bind(&obs.title)
+        .bind(&obs.subtitle)
+        .bind(&obs.narrative)
+        .bind(serde_json::to_value(&obs.facts)?)
+        .bind(serde_json::to_value(&obs.concepts)?)
+        .bind(serde_json::to_value(&obs.files_read)?)
+        .bind(serde_json::to_value(&obs.files_modified)?)
+        .bind(serde_json::to_value(&obs.keywords)?)
+        .bind(
+            obs.prompt_number
+                .map(|v| v.as_pg_i32())
+                .transpose()
+                .map_err(|e| StorageError::DataCorruption {
+                    context: "prompt_number exceeds i32::MAX".into(),
+                    source: Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()),
+                })?,
+        )
+        .bind(
+            obs.discovery_tokens
+                .map(|v| v.as_pg_i32())
+                .transpose()
+                .map_err(|e| StorageError::DataCorruption {
+                    context: "discovery_tokens exceeds i32::MAX".into(),
+                    source: Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()),
+                })?,
+        )
+        .bind(obs.noise_level.as_str())
+        .bind(&obs.noise_reason)
+        .bind(obs.created_at)
+        .execute(&self.pool)
+        .await;
+        match result {
+            Ok(r) => Ok(r.rows_affected() > 0),
+            Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("23505") => {
+                Err(StorageError::Duplicate(format!(
+                    "Observation title '{}' already exists",
+                    obs.title
+                )))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn get_by_id(&self, id: &str) -> Result<Option<Observation>, StorageError> {
+        let row = sqlx::query(&format!(
+            "SELECT {}
+             FROM observations WHERE id = $1",
+            super::OBSERVATION_COLUMNS
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| row_to_observation(&r)).transpose()
+    }
+
+    async fn get_recent(&self, limit: usize) -> Result<Vec<Observation>, StorageError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {} \
+             FROM observations ORDER BY created_at DESC, id DESC LIMIT $1",
+            super::OBSERVATION_COLUMNS
+        ))
+        .bind(usize_to_i64(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(collect_skipping_corrupt(
+            rows.iter().map(row_to_observation),
+        )?)
+    }
+
+    async fn get_session_observations(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<Observation>, StorageError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {}
+             FROM observations WHERE session_id = $1 ORDER BY created_at",
+            super::OBSERVATION_COLUMNS
+        ))
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(collect_skipping_corrupt(
+            rows.iter().map(row_to_observation),
+        )?)
+    }
+    async fn get_recent_session_observations(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Observation>, StorageError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {}
+             FROM observations WHERE session_id = $1 ORDER BY created_at DESC LIMIT $2",
+            super::OBSERVATION_COLUMNS
+        ))
+        .bind(session_id)
+        .bind(usize_to_i64(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(collect_skipping_corrupt(
+            rows.iter().map(row_to_observation),
+        )?)
+    }
+
+    async fn get_observations_by_ids(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<Observation>, StorageError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(&format!(
+            "SELECT {}
+             FROM observations WHERE id = ANY($1) ORDER BY created_at DESC",
+            super::OBSERVATION_COLUMNS
+        ))
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(collect_skipping_corrupt(
+            rows.iter().map(row_to_observation),
+        )?)
+    }
+
+    async fn get_context_for_project(
+        &self,
+        project: &str,
+        limit: usize,
+    ) -> Result<Vec<Observation>, StorageError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {}
+             FROM observations
+             WHERE (project = $1 OR project IS NULL)
+               AND noise_level NOT IN ('low', 'negligible')
+             ORDER BY created_at DESC LIMIT $2",
+            super::OBSERVATION_COLUMNS
+        ))
+        .bind(project)
+        .bind(usize_to_i64(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(collect_skipping_corrupt(
+            rows.iter().map(row_to_observation),
+        )?)
+    }
+
+    async fn get_session_observation_count(&self, session_id: &str) -> Result<usize, StorageError> {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM observations WHERE session_id = $1")
+                .bind(session_id)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(usize::try_from(count).unwrap_or(0))
+    }
+
+    async fn search_by_file(
+        &self,
+        file_path: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>, StorageError> {
+        let jsonb_str = serde_json::json!([file_path]).to_string();
+        let rows = sqlx::query(
+            r#"SELECT id, title, subtitle, observation_type, noise_level, 0.0::float8 as score
+               FROM observations
+               WHERE files_read @> $1::jsonb OR files_modified @> $1::jsonb
+               ORDER BY created_at DESC, id DESC LIMIT $2"#,
+        )
+        .bind(&jsonb_str)
+        .bind(usize_to_i64(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(collect_skipping_corrupt(
+            rows.iter().map(row_to_search_result),
+        )?)
+    }
+
+    async fn merge_into_existing(
+        &self,
+        existing_id: &str,
+        newer: &Observation,
+        force_newer: bool,
+    ) -> Result<(), StorageError> {
+        let mut tx = self.pool.begin().await?;
+
+        let row = sqlx::query(&format!(
+            "SELECT {} FROM observations WHERE id = $1 FOR UPDATE",
+            super::OBSERVATION_COLUMNS
+        ))
+        .bind(existing_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let existing = row
+            .map(|r| row_to_observation(&r))
+            .transpose()?
+            .ok_or_else(|| StorageError::NotFound {
+                entity: "observation",
+                id: existing_id.to_owned(),
+            })?;
+
+        let merged = opencode_mem_core::compute_merge(&existing, newer, force_newer);
+
+        self.update_observation_fields(&mut tx, existing_id, &merged)
+            .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn merge_and_purge(
+        &self,
+        keeper_id: &str,
+        duplicate_id: &str,
+    ) -> Result<(), StorageError> {
+        let mut tx = self.pool.begin().await?;
+
+        // 1. Lock both rows in a deterministic order to prevent deadlocks.
+        // Using a single query with ORDER BY id FOR UPDATE ensures consistent lock acquisition sequence.
+        let rows = sqlx::query(&format!(
+            "SELECT {} FROM observations WHERE id IN ($1, $2) ORDER BY id FOR UPDATE",
+            super::OBSERVATION_COLUMNS
+        ))
+        .bind(keeper_id)
+        .bind(duplicate_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        if rows.len() < 2 {
+            return Err(StorageError::NotFound {
+                entity: "observation(s)",
+                id: format!("{} and/or {}", keeper_id, duplicate_id),
+            });
+        }
+
+        let mut keeper = None;
+        let mut duplicate = None;
+
+        for row in rows {
+            let obs = row_to_observation(&row)?;
+            if obs.id.as_ref() == keeper_id {
+                keeper = Some(obs);
+            } else {
+                duplicate = Some(obs);
+            }
+        }
+
+        let keeper = keeper.ok_or_else(|| StorageError::NotFound {
+            entity: "observation",
+            id: keeper_id.to_owned(),
+        })?;
+        let duplicate = duplicate.ok_or_else(|| StorageError::NotFound {
+            entity: "observation",
+            id: duplicate_id.to_owned(),
+        })?;
+
+        // 2. Compute merge (background dedup uses standard metric-based merging)
+        let merged = opencode_mem_core::compute_merge(&keeper, &duplicate, false);
+
+        // 3. Update keeper with merged data
+        self.update_observation_fields(&mut tx, keeper_id, &merged)
+            .await?;
+
+        // 4. Repoint knowledge entries (replace duplicate_id with keeper_id in jsonb array)
+        // Correct PostgreSQL logic: remove duplicate_id, add keeper_id, then DISTINCT to avoid duplicates.
+        sqlx::query(
+            "UPDATE global_knowledge \
+             SET source_observations = ( \
+                 SELECT jsonb_agg(DISTINCT x) \
+                 FROM jsonb_array_elements_text(source_observations - $1::text || jsonb_build_array($2::text)) AS x \
+             ) \
+             WHERE source_observations ? $1",
+        )
+        .bind(duplicate_id)
+        .bind(keeper_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // 5. Repoint injected_observations (replace duplicate_id with keeper_id)
+        sqlx::query(
+            "INSERT INTO injected_observations (session_id, observation_id) \
+             SELECT session_id, $2 FROM injected_observations WHERE observation_id = $1 \
+             ON CONFLICT (session_id, observation_id) DO NOTHING",
+        )
+        .bind(duplicate_id)
+        .bind(keeper_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // 6. Delete duplicate observation (will cascade to injected_observations due to FK)
+        sqlx::query("DELETE FROM observations WHERE id = $1")
+            .bind(duplicate_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn update_observation_metadata(
+        &self,
+        id: &str,
+        metadata: &ObservationMetadata,
+    ) -> Result<bool, StorageError> {
+        let concepts_str: Vec<String> = metadata.concepts.iter().map(|c| c.to_string()).collect();
+
+        let has_classification =
+            metadata.observation_type.is_some() || metadata.noise_level.is_some();
+
+        // Concurrency guard: only update metadata if arrays are currently empty.
+        // Prevents lost updates when a concurrent dedup merge or manual edit
+        // populates metadata during the LLM enrichment window.
+        let empty_guard = "AND (facts IS NULL OR facts = '[]'::jsonb)";
+
+        let result = if has_classification {
+            let obs_type = metadata
+                .observation_type
+                .as_ref()
+                .map(opencode_mem_core::ObservationType::as_str);
+            let noise = metadata
+                .noise_level
+                .as_ref()
+                .map(opencode_mem_core::NoiseLevel::as_str);
+
+            sqlx::query(&format!(
+                "UPDATE observations \
+                 SET facts = $1, concepts = $2, keywords = $3, \
+                     files_read = $4, files_modified = $5, \
+                     observation_type = COALESCE($7, observation_type), \
+                     noise_level = COALESCE($8, noise_level), \
+                     updated_at = NOW() \
+                 WHERE id = $6 {empty_guard}",
+            ))
+            .bind(serde_json::to_value(&metadata.facts)?)
+            .bind(serde_json::to_value(&concepts_str)?)
+            .bind(serde_json::to_value(&metadata.keywords)?)
+            .bind(serde_json::to_value(&metadata.files_read)?)
+            .bind(serde_json::to_value(&metadata.files_modified)?)
+            .bind(id)
+            .bind(obs_type)
+            .bind(noise)
+            .execute(&self.pool)
+            .await?
+        } else {
+            sqlx::query(&format!(
+                "UPDATE observations \
+                 SET facts = $1, concepts = $2, keywords = $3, \
+                     files_read = $4, files_modified = $5, \
+                     updated_at = NOW() \
+                 WHERE id = $6 {empty_guard}",
+            ))
+            .bind(serde_json::to_value(&metadata.facts)?)
+            .bind(serde_json::to_value(&concepts_str)?)
+            .bind(serde_json::to_value(&metadata.keywords)?)
+            .bind(serde_json::to_value(&metadata.files_read)?)
+            .bind(serde_json::to_value(&metadata.files_modified)?)
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+        };
+
+        let updated = result.rows_affected() > 0;
+
+        if !updated {
+            tracing::warn!(
+                observation_id = %id,
+                "Enrichment update skipped: observation not found or metadata already populated"
+            );
+        } else if has_classification {
+            tracing::info!(
+                observation_id = %id,
+                observation_type = ?metadata.observation_type,
+                noise_level = ?metadata.noise_level,
+                "Updated observation classification via enrichment"
+            );
+        }
+        Ok(updated)
+    }
+
+    async fn get_observations_with_empty_metadata(
+        &self,
+        limit: usize,
+        excluded_ids: &[String],
+    ) -> Result<Vec<Observation>, StorageError> {
+        let rows = if excluded_ids.is_empty() {
+            sqlx::query(&format!(
+                "SELECT {} \
+                 FROM observations \
+                 WHERE (facts IS NULL OR jsonb_array_length(facts) = 0) \
+                   AND (concepts IS NULL OR jsonb_array_length(concepts) = 0) \
+                   AND (keywords IS NULL OR jsonb_array_length(keywords) = 0) \
+                 ORDER BY created_at DESC, id DESC LIMIT $1",
+                super::OBSERVATION_COLUMNS
+            ))
+            .bind(usize_to_i64(limit))
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(&format!(
+                "SELECT {} \
+                 FROM observations \
+                 WHERE (facts IS NULL OR jsonb_array_length(facts) = 0) \
+                   AND (concepts IS NULL OR jsonb_array_length(concepts) = 0) \
+                   AND (keywords IS NULL OR jsonb_array_length(keywords) = 0) \
+                   AND NOT (id = ANY($2)) \
+                 ORDER BY created_at DESC, id DESC LIMIT $1",
+                super::OBSERVATION_COLUMNS
+            ))
+            .bind(usize_to_i64(limit))
+            .bind(excluded_ids)
+            .fetch_all(&self.pool)
+            .await?
+        };
+        Ok(collect_skipping_corrupt(
+            rows.iter().map(row_to_observation),
+        )?)
+    }
+}

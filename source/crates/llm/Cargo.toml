@@ -1,0 +1,29 @@
+[package]
+name = "opencode-mem-llm"
+version.workspace = true
+edition.workspace = true
+description = "LLM integration for observation compression and knowledge extraction"
+keywords = ["llm", "ai", "memory", "opencode"]
+categories = ["development-tools"]
+homepage = "https://github.com/Stranmor/opencode-mem"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+opencode-mem-core = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+wiremock = "0.6"

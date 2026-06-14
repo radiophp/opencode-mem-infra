@@ -1,0 +1,30 @@
+[package]
+name = "opencode-mem-mcp"
+version.workspace = true
+edition.workspace = true
+description = "MCP (Model Context Protocol) stdio server"
+keywords = ["mcp", "memory", "opencode", "ai"]
+categories = ["development-tools"]
+homepage = "https://github.com/Stranmor/opencode-mem"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+opencode-mem-core = { workspace = true }
+opencode-mem-storage = { workspace = true }
+opencode-mem-service = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+ [dev-dependencies]
+ opencode-mem-llm = { workspace = true }
+ sqlx = { workspace = true }
+

@@ -1,0 +1,239 @@
+use crate::StorageError;
+use chrono::{DateTime, Utc};
+use opencode_mem_core::{InfiniteEventType, RawInfiniteEvent, StoredInfiniteEvent};
+use sqlx::PgPool;
+use std::str::FromStr;
+
+type StoredEventRow = (
+    i64,
+    DateTime<Utc>,
+    String,
+    Option<String>,
+    String,
+    serde_json::Value,
+    Vec<String>,
+    Vec<String>,
+    Option<String>,
+);
+
+pub async fn store_infinite_event(
+    pool: &PgPool,
+    event: RawInfiniteEvent,
+) -> Result<i64, StorageError> {
+    let row: (i64,) = sqlx::query_as(
+        r#"
+        INSERT INTO raw_events (session_id, project, event_type, content, files, tools, call_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (call_id) WHERE call_id IS NOT NULL DO UPDATE SET call_id = EXCLUDED.call_id
+        RETURNING id
+        "#,
+    )
+    .bind(&event.session_id)
+    .bind(&event.project)
+    .bind(event.event_type.as_str())
+    .bind(&event.content)
+    .bind(&event.files)
+    .bind(&event.tools)
+    .bind(&event.call_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row.0)
+}
+
+pub async fn get_recent_infinite_events(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<StoredInfiniteEvent>, StorageError> {
+    let rows = sqlx::query_as::<_, StoredEventRow>(&format!(
+        "SELECT {} FROM raw_events ORDER BY ts DESC LIMIT $1",
+        crate::pg_storage::EVENT_COLUMNS
+    ))
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().filter_map(row_to_stored_event).collect())
+}
+
+pub async fn release_infinite_events(
+    pool: &PgPool,
+    ids: &[i64],
+    increment_retry: bool,
+) -> Result<(), StorageError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        "UPDATE raw_events \
+         SET processing_started_at = CASE WHEN $2 THEN NOW() ELSE NULL END, \
+             processing_instance_id = NULL, \
+             retry_count = CASE WHEN $2 THEN retry_count + 1 ELSE retry_count END \
+         WHERE id = ANY($1)",
+    )
+    .bind(ids)
+    .bind(increment_retry)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn get_unsummarized_infinite_events(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<StoredInfiniteEvent>, StorageError> {
+    let instance_id = uuid::Uuid::new_v4().to_string();
+
+    let rows = sqlx::query_as::<_, StoredEventRow>(&format!(
+        "UPDATE raw_events \
+        SET processing_started_at = NOW(), \
+            processing_instance_id = $2 \
+        WHERE id IN ( \
+            SELECT id FROM raw_events \
+            WHERE summary_5min_id IS NULL \
+              AND retry_count < 3 \
+              AND (processing_started_at IS NULL OR processing_started_at < NOW() - INTERVAL '5 minutes') \
+            ORDER BY ts ASC \
+            LIMIT $1 \
+            FOR UPDATE SKIP LOCKED \
+        ) \
+        RETURNING {}",
+        crate::pg_storage::EVENT_COLUMNS
+    ))
+    .bind(limit)
+    .bind(&instance_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().filter_map(row_to_stored_event).collect())
+}
+
+pub async fn get_infinite_events_by_summary_id(
+    pool: &PgPool,
+    summary_5min_id: i64,
+    limit: i64,
+) -> Result<Vec<StoredInfiniteEvent>, StorageError> {
+    let rows = sqlx::query_as::<_, StoredEventRow>(&format!(
+        "SELECT {} \
+        FROM raw_events \
+        WHERE summary_5min_id = $1 \
+        ORDER BY ts ASC \
+        LIMIT $2",
+        crate::pg_storage::EVENT_COLUMNS
+    ))
+    .bind(summary_5min_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().filter_map(row_to_stored_event).collect())
+}
+
+pub async fn get_infinite_events_by_time_range(
+    pool: &PgPool,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    session_id: Option<&str>,
+    limit: i64,
+) -> Result<Vec<StoredInfiniteEvent>, StorageError> {
+    let rows = if let Some(sid) = session_id {
+        sqlx::query_as::<_, StoredEventRow>(&format!(
+            "SELECT {} \
+            FROM raw_events \
+            WHERE ts >= $1 AND ts <= $2 AND session_id = $3 \
+            ORDER BY ts ASC \
+            LIMIT $4",
+            crate::pg_storage::EVENT_COLUMNS
+        ))
+        .bind(start)
+        .bind(end)
+        .bind(sid)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as::<_, StoredEventRow>(&format!(
+            "SELECT {} \
+            FROM raw_events \
+            WHERE ts >= $1 AND ts <= $2 \
+            ORDER BY ts ASC \
+            LIMIT $3",
+            crate::pg_storage::EVENT_COLUMNS
+        ))
+        .bind(start)
+        .bind(end)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
+    };
+
+    Ok(rows.into_iter().filter_map(row_to_stored_event).collect())
+}
+
+pub async fn search_infinite_events(
+    pool: &PgPool,
+    query: &str,
+    limit: i64,
+) -> Result<Vec<StoredInfiniteEvent>, StorageError> {
+    let escaped = crate::pg_storage::escape_like(query);
+    let rows = sqlx::query_as::<_, StoredEventRow>(&format!(
+        "SELECT {} \
+        FROM raw_events \
+        WHERE content::text ILIKE '%' || $1 || '%' \
+        ORDER BY ts DESC \
+        LIMIT $2",
+        crate::pg_storage::EVENT_COLUMNS
+    ))
+    .bind(escaped)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().filter_map(row_to_stored_event).collect())
+}
+
+pub async fn infinite_memory_stats(pool: &PgPool) -> Result<serde_json::Value, StorageError> {
+    let event_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM raw_events")
+        .fetch_one(pool)
+        .await?;
+
+    let summary_5min_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM summaries_5min")
+        .fetch_one(pool)
+        .await?;
+
+    let summary_hour_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM summaries_hour")
+        .fetch_one(pool)
+        .await?;
+
+    let summary_day_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM summaries_day")
+        .fetch_one(pool)
+        .await?;
+
+    Ok(serde_json::json!({
+        "raw_events": event_count.0,
+        "summaries_5min": summary_5min_count.0,
+        "summaries_hour": summary_hour_count.0,
+        "summaries_day": summary_day_count.0
+    }))
+}
+
+fn row_to_stored_event(row: StoredEventRow) -> Option<StoredInfiniteEvent> {
+    let (id, ts, session_id, project, event_type_str, content, files, tools, call_id) = row;
+    match InfiniteEventType::from_str(&event_type_str) {
+        Ok(event_type) => Some(StoredInfiniteEvent {
+            id,
+            ts,
+            session_id,
+            project,
+            event_type,
+            content,
+            files,
+            tools,
+            call_id,
+        }),
+        Err(_) => {
+            tracing::warn!("Unknown event type in DB row {}: '{}'", id, event_type_str);
+            None
+        }
+    }
+}

@@ -1,0 +1,201 @@
+//! Storage types shared across modules
+
+use serde::{Deserialize, Serialize};
+use std::str::FromStr;
+
+/// Statistics about storage contents
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[non_exhaustive]
+pub struct StorageStats {
+    /// Number of observations in storage.
+    pub observation_count: u64,
+    /// Number of sessions in storage.
+    pub session_count: u64,
+    /// Number of session summaries in storage.
+    pub summary_count: u64,
+    /// Number of user prompts in storage.
+    pub prompt_count: u64,
+    /// Number of projects in storage.
+    pub project_count: u64,
+}
+
+/// Generic paginated result
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[non_exhaustive]
+pub struct PaginatedResult<T> {
+    /// Items in the current page.
+    pub items: Vec<T>,
+    /// Total number of items across all pages.
+    pub total: u64,
+    /// Offset from the start.
+    pub offset: u64,
+    /// Maximum items per page.
+    pub limit: u64,
+}
+
+impl<T> PaginatedResult<T> {
+    /// Construct from raw values (safe conversion, no `as` casts).
+    ///
+    /// Accepts `i64` for `total` because SQL `COUNT(*)` returns `i64`.
+    /// Negative or out-of-range values saturate to 0 or `u64::MAX`.
+    #[must_use]
+    pub fn new(items: Vec<T>, total: i64, offset: usize, limit: usize) -> Self {
+        Self {
+            items,
+            total: u64::try_from(total).unwrap_or(0),
+            offset: u64::try_from(offset).unwrap_or(u64::MAX),
+            limit: u64::try_from(limit).unwrap_or(u64::MAX),
+        }
+    }
+
+    /// Return an empty result set (useful for degraded mode).
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            items: Vec::new(),
+            total: 0,
+            offset: 0,
+            limit: 0,
+        }
+    }
+}
+
+/// Status of a pending message in the processing queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum PendingMessageStatus {
+    /// Message is waiting to be processed.
+    Pending,
+    /// Message is currently being processed.
+    Processing,
+    /// Message has been successfully processed.
+    Processed,
+    /// Message processing failed.
+    Failed,
+}
+
+impl PendingMessageStatus {
+    /// Returns the string representation of the status.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match *self {
+            Self::Pending => "pending",
+            Self::Processing => "processing",
+            Self::Processed => "processed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl FromStr for PendingMessageStatus {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(Self::Pending),
+            "processing" => Ok(Self::Processing),
+            "processed" => Ok(Self::Processed),
+            "failed" => Ok(Self::Failed),
+            _ => Err(anyhow::anyhow!("Invalid pending message status: {s}")),
+        }
+    }
+}
+
+/// A message in the pending processing queue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct PendingMessage {
+    /// Unique database ID.
+    pub id: i64,
+    /// Session this message belongs to.
+    pub session_id: String,
+    /// Unique call ID from tool invocation (for idempotent logging).
+    pub call_id: Option<String>,
+    /// Current processing status.
+    pub status: PendingMessageStatus,
+    /// Name of the tool that was called.
+    pub tool_name: Option<String>,
+    /// Input provided to the tool.
+    pub tool_input: Option<String>,
+    /// Response from the tool.
+    pub tool_response: Option<String>,
+    /// Number of retry attempts.
+    pub retry_count: i32,
+    /// Unix timestamp when message was created.
+    pub created_at_epoch: i64,
+    /// Unix timestamp when message was claimed for processing.
+    pub claimed_at_epoch: Option<i64>,
+    /// Unix timestamp when processing completed.
+    pub completed_at_epoch: Option<i64>,
+    /// Project this message belongs to.
+    pub project: Option<String>,
+}
+
+impl PendingMessage {
+    /// Create a new pending message (used by service layer for buffering).
+    #[must_use]
+    pub fn new(
+        session_id: String,
+        call_id: Option<String>,
+        tool_name: Option<String>,
+        tool_input: Option<String>,
+        tool_response: Option<String>,
+        project: Option<String>,
+    ) -> Self {
+        Self {
+            id: 0,
+            session_id,
+            call_id,
+            status: PendingMessageStatus::Pending,
+            tool_name,
+            tool_input,
+            tool_response,
+            retry_count: 0,
+            created_at_epoch: chrono::Utc::now().timestamp(),
+            claimed_at_epoch: None,
+            completed_at_epoch: None,
+            project,
+        }
+    }
+}
+
+use std::sync::OnceLock;
+
+static MAX_RETRY: OnceLock<i32> = OnceLock::new();
+static VISIBILITY_TIMEOUT: OnceLock<i64> = OnceLock::new();
+
+/// Initialize queue config from `AppConfig` at startup.
+/// Must be called before any queue operations.
+pub fn init_queue_config(max_retry: i32, visibility_timeout_secs: i64) {
+    let _ = MAX_RETRY.set(max_retry);
+    let _ = VISIBILITY_TIMEOUT.set(visibility_timeout_secs);
+}
+
+#[must_use]
+pub fn max_retry_count() -> i32 {
+    *MAX_RETRY
+        .get()
+        .expect("init_queue_config must be called before use")
+}
+
+#[must_use]
+pub fn default_visibility_timeout_secs() -> i64 {
+    *VISIBILITY_TIMEOUT
+        .get()
+        .expect("init_queue_config must be called before use")
+}
+
+/// Statistics about the pending message queue.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[non_exhaustive]
+pub struct QueueStats {
+    /// Number of messages waiting to be processed.
+    pub pending: u64,
+    /// Number of messages currently being processed.
+    pub processing: u64,
+    /// Number of messages that failed processing.
+    pub failed: u64,
+    /// Number of successfully processed messages.
+    pub processed: u64,
+}

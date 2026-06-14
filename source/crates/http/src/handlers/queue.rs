@@ -1,0 +1,222 @@
+use crate::api_error::{ApiError, OrDegraded};
+use axum::{
+    Json,
+    extract::{ConnectInfo, Query, State},
+};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
+use opencode_mem_service::default_visibility_timeout_secs;
+
+use crate::AppState;
+use crate::api_types::{
+    ClearQueueResponse, PendingQueueResponse, ProcessQueueResponse, ProcessingStatusResponse,
+    RetryQueueResponse, SearchQuery, SetProcessingRequest, SetProcessingResponse,
+};
+
+use super::queue_processor::{max_queue_workers, process_pending_message};
+
+pub async fn get_pending_queue(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SearchQuery>,
+) -> Result<Json<PendingQueueResponse>, crate::api_error::ApiError> {
+    let messages = state
+        .queue_service
+        .get_all_pending_messages(query.capped_limit())
+        .await
+        .or_degraded(Vec::<opencode_mem_service::PendingMessage>::new())?;
+    let queue_stats = state
+        .queue_service
+        .get_queue_stats()
+        .await
+        .or_degraded(opencode_mem_service::QueueStats::default())?;
+    Ok(Json(PendingQueueResponse {
+        messages,
+        stats: queue_stats,
+    }))
+}
+
+pub async fn process_pending_queue(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(()): Json<()>,
+) -> Result<Json<ProcessQueueResponse>, crate::api_error::ApiError> {
+    if !super::check_admin_access(&addr, &headers, &state.config) {
+        return Err(crate::api_error::ApiError::Forbidden("Forbidden".into()));
+    }
+    if !state.processing_active.load(Ordering::SeqCst) {
+        return Ok(Json(ProcessQueueResponse {
+            processed: 0,
+            failed: 0,
+        }));
+    }
+    let max_workers = max_queue_workers(&state);
+
+    // Reserve permits FIRST to avoid thundering herd and unnecessary DB load.
+    // If multiple callers fire concurrently, they will strictly share the semaphore capacity.
+    let available_permits = state.semaphore.available_permits().min(max_workers);
+    if available_permits == 0 {
+        return Ok(Json(ProcessQueueResponse {
+            processed: 0,
+            failed: 0,
+        }));
+    }
+
+    let mut permits = Vec::with_capacity(available_permits);
+    for _ in 0..available_permits {
+        if let Ok(p) = Arc::clone(&state.semaphore).try_acquire_owned() {
+            permits.push(p);
+        } else {
+            break;
+        }
+    }
+
+    if permits.is_empty() {
+        return Ok(Json(ProcessQueueResponse {
+            processed: 0,
+            failed: 0,
+        }));
+    }
+
+    let claim_limit = permits.len();
+    let messages = state
+        .queue_service
+        .claim_pending_messages(claim_limit, default_visibility_timeout_secs())
+        .await
+        .map_err(ApiError::from)?;
+
+    if messages.is_empty() {
+        return Ok(Json(ProcessQueueResponse {
+            processed: 0,
+            failed: 0,
+        }));
+    }
+
+    let mut handles = Vec::with_capacity(messages.len());
+    let messages_iter = messages.into_iter();
+
+    for msg in messages_iter {
+        let Some(permit) = permits.pop() else {
+            tracing::error!(
+                msg_id = msg.id,
+                "No permit available for message — skipping"
+            );
+            continue;
+        };
+        let state_clone = Arc::clone(&state);
+        let handle = tokio::spawn(async move {
+            let _permit = permit;
+            let result = process_pending_message(&state_clone, &msg).await;
+            match result {
+                Ok(()) => {
+                    if let Err(e) = state_clone.queue_service.complete_message(msg.id).await {
+                        tracing::error!("Complete message {} failed: {}", msg.id, e);
+                        return false;
+                    }
+                    true
+                }
+                Err(e) => {
+                    tracing::error!("Process message {} failed: {}", msg.id, e);
+                    if let Err(e) = state_clone.queue_service.fail_message(msg.id, false).await {
+                        tracing::error!("Fail message {} error: {}", msg.id, e);
+                    }
+                    false
+                }
+            }
+        });
+        handles.push(handle);
+    }
+
+    let processed = handles.len();
+    let mut failed = 0usize;
+    for handle in handles {
+        match handle.await {
+            Ok(true) => {}
+            Ok(false) => failed = failed.saturating_add(1),
+            Err(_join_err) => failed = failed.saturating_add(1),
+        }
+    }
+
+    Ok(Json(ProcessQueueResponse { processed, failed }))
+}
+
+pub async fn clear_failed_queue(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(()): Json<()>,
+) -> Result<Json<ClearQueueResponse>, crate::api_error::ApiError> {
+    if !super::check_admin_access(&addr, &headers, &state.config) {
+        return Err(crate::api_error::ApiError::Forbidden("Forbidden".into()));
+    }
+    let cleared = state
+        .queue_service
+        .clear_failed_messages()
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ClearQueueResponse { cleared }))
+}
+
+pub async fn retry_failed_queue(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(()): Json<()>,
+) -> Result<Json<RetryQueueResponse>, crate::api_error::ApiError> {
+    if !super::check_admin_access(&addr, &headers, &state.config) {
+        return Err(crate::api_error::ApiError::Forbidden("Forbidden".into()));
+    }
+    let retried = state
+        .queue_service
+        .retry_failed_messages()
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(RetryQueueResponse { retried }))
+}
+
+pub async fn clear_all_queue(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(()): Json<()>,
+) -> Result<Json<ClearQueueResponse>, crate::api_error::ApiError> {
+    if !super::check_admin_access(&addr, &headers, &state.config) {
+        return Err(crate::api_error::ApiError::Forbidden("Forbidden".into()));
+    }
+    let cleared = state
+        .queue_service
+        .clear_all_pending_messages()
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ClearQueueResponse { cleared }))
+}
+
+pub async fn get_processing_status(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<ProcessingStatusResponse>, crate::api_error::ApiError> {
+    let active = state.processing_active.load(Ordering::SeqCst);
+    let pending_count = state
+        .queue_service
+        .get_pending_count()
+        .await
+        .or_degraded(0usize)?;
+    Ok(Json(ProcessingStatusResponse {
+        active,
+        pending_count,
+    }))
+}
+
+pub async fn set_processing_status(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SetProcessingRequest>,
+) -> Result<Json<SetProcessingResponse>, crate::api_error::ApiError> {
+    if !super::check_admin_access(&addr, &headers, &state.config) {
+        return Err(crate::api_error::ApiError::Forbidden("Forbidden".into()));
+    }
+    state.processing_active.store(req.active, Ordering::SeqCst);
+    Ok(Json(SetProcessingResponse { active: req.active }))
+}

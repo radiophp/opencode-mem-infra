@@ -1,0 +1,49 @@
+//! Test utilities and module declarations for storage tests.
+
+use chrono::Utc;
+use opencode_mem_core::{
+    ContentSessionId, NoiseLevel, Observation, ObservationType, ProjectId, Session, SessionId,
+    SessionStatus,
+};
+
+#[allow(dead_code, reason = "retained for future PG integration tests")]
+pub fn create_test_observation(id: &str, project: &str) -> Observation {
+    Observation::builder(
+        id.to_owned(),
+        "test-session".to_owned(),
+        ObservationType::Discovery,
+        format!("Test observation {id}"),
+    )
+    .project(project)
+    .subtitle("Test subtitle")
+    .narrative("Test narrative")
+    .facts(vec!["fact1".to_owned(), "fact2".to_owned()])
+    .files_read(vec!["file1.rs".to_owned()])
+    .files_modified(vec!["file2.rs".to_owned()])
+    .keywords(vec!["test".to_owned(), "keyword".to_owned()])
+    .prompt_number(1)
+    .discovery_tokens(100)
+    .noise_level(NoiseLevel::Medium)
+    .build()
+}
+
+#[allow(dead_code, reason = "retained for future PG integration tests")]
+pub fn create_test_session(id: &str) -> Session {
+    Session::new(
+        SessionId::from(id),
+        ContentSessionId::from(format!("content-{id}")),
+        Some(format!("memory-{id}")),
+        ProjectId::from("test-project"),
+        Some("Test prompt".to_owned()),
+        Utc::now(),
+        None,
+        SessionStatus::Active,
+        0,
+    )
+}
+
+mod classification_race_tests;
+mod embedding_text_tests;
+mod knowledge_race_tests;
+mod knowledge_trigram_tests;
+mod union_dedup_tests;

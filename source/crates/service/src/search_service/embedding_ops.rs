@@ -1,0 +1,235 @@
+//! Embedding backfill and semantic deduplication logic for SearchService.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use opencode_mem_core::{Observation, cosine_similarity};
+use opencode_mem_embeddings::EmbeddingProvider;
+use opencode_mem_storage::traits::EmbeddingStore;
+
+use crate::ServiceError;
+
+use super::SearchService;
+
+impl SearchService {
+    pub async fn clear_embeddings(&self) -> Result<(), ServiceError> {
+        let result = self
+            .storage
+            .guarded(|| self.storage.clear_embeddings())
+            .await;
+        self.with_cb(result)
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "total counter increment is safe - max value is batch_size iterations"
+    )]
+    pub async fn run_embedding_backfill(&self, batch_size: usize) -> Result<usize, ServiceError> {
+        let Some(ref embeddings) = self.embeddings else {
+            return Ok(0);
+        };
+        let mut total = 0;
+        let mut failed_ids_vec = Vec::new();
+        loop {
+            let ids: Vec<String> = failed_ids_vec.to_vec();
+            let all_obs = self
+                .storage
+                .guarded(|| {
+                    self.storage
+                        .get_observations_without_embeddings(batch_size, &ids)
+                })
+                .await
+                .map_err(ServiceError::from)?;
+
+            if all_obs.is_empty() {
+                break;
+            }
+            let all_count = all_obs.len();
+            for o in all_obs {
+                let text = format!(
+                    "{} {} {}",
+                    o.title,
+                    o.narrative.as_deref().unwrap_or(""),
+                    o.facts.join(" ")
+                );
+                let emb = Arc::clone(embeddings);
+                let embed_result = tokio::task::spawn_blocking(move || emb.embed(&text))
+                    .await
+                    .unwrap_or_else(
+                        |e| Err(anyhow::anyhow!("spawn_blocking failed: {}", e).into()),
+                    );
+
+                match embed_result {
+                    Ok(vec) => {
+                        if self
+                            .storage
+                            .guarded(|| self.storage.store_embedding(&o.id, &vec))
+                            .await
+                            .is_ok()
+                        {
+                            total += 1;
+                        } else {
+                            failed_ids_vec.push(o.id.to_string());
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to generate embedding for {}: {}", o.id, e);
+                        failed_ids_vec.push(o.id.to_string());
+                    }
+                }
+            }
+
+            if all_count < batch_size {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
+    // ── Semantic dedup ──────────────────────────────────────────────────
+    pub(crate) async fn deduplicate_by_embedding(
+        &self,
+        observations: Vec<Observation>,
+    ) -> Result<Vec<Observation>, ServiceError> {
+        if observations.len() <= 1 {
+            return Ok(observations);
+        }
+
+        // Check if deduplication is disabled via threshold
+        if self.dedup_threshold <= 0.0 {
+            return Ok(observations);
+        }
+
+        // Without embeddings, skip dedup — just return filtered results
+        if self.embeddings.is_none() {
+            return Ok(observations);
+        }
+
+        let ids: Vec<String> = observations.iter().map(|o| o.id.to_string()).collect();
+        let embedding_pairs = self
+            .storage
+            .guarded(|| self.storage.get_embeddings_for_ids(&ids))
+            .await
+            .map_err(ServiceError::from)?;
+
+        if embedding_pairs.is_empty() {
+            return Ok(observations);
+        }
+
+        // O(N²) comparison in spawn_blocking to avoid starving the async executor
+        let obs_data: Vec<(
+            String,
+            opencode_mem_core::NoiseLevel,
+            chrono::DateTime<chrono::Utc>,
+        )> = observations
+            .iter()
+            .map(|o| (o.id.to_string(), o.noise_level, o.created_at))
+            .collect();
+
+        let embedding_owned: Vec<(String, Vec<f32>)> = embedding_pairs;
+        let dedup_threshold = self.dedup_threshold;
+        let obs_for_blocking = observations.clone();
+
+        let kept_indices = tokio::task::spawn_blocking(move || {
+            let emb_map: HashMap<&str, &[f32]> = embedding_owned
+                .iter()
+                .map(|(id, vec)| (id.as_str(), vec.as_slice()))
+                .collect();
+
+            let obs_count = obs_data.len();
+            let mut parent: Vec<usize> = (0..obs_count).collect();
+
+            fn find(parent: &mut [usize], mut i: usize) -> usize {
+                while let Some(&p) = parent.get(i) {
+                    if p == i {
+                        break;
+                    }
+                    let gp = parent.get(p).copied().unwrap_or(p);
+                    if let Some(slot) = parent.get_mut(i) {
+                        *slot = gp;
+                    }
+                    i = p;
+                }
+                i
+            }
+
+            for i in 0..obs_count {
+                let Some(emb_a) = obs_data
+                    .get(i)
+                    .and_then(|(id, _, _)| emb_map.get(id.as_str()))
+                else {
+                    continue;
+                };
+                for j in (i.checked_add(1).unwrap_or(obs_count))..obs_count {
+                    let Some(emb_b) = obs_data
+                        .get(j)
+                        .and_then(|(id, _, _)| emb_map.get(id.as_str()))
+                    else {
+                        continue;
+                    };
+                    let sim = cosine_similarity(emb_a, emb_b);
+                    if sim > dedup_threshold {
+                        let ra = find(&mut parent, i);
+                        let rb = find(&mut parent, j);
+                        if ra != rb
+                            && let Some(slot) = parent.get_mut(rb)
+                        {
+                            *slot = ra;
+                        }
+                    }
+                }
+            }
+
+            let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
+            for idx in 0..obs_count {
+                let root = find(&mut parent, idx);
+                groups.entry(root).or_default().push(idx);
+            }
+
+            let mut kept: Vec<usize> = Vec::with_capacity(groups.len());
+            for members in groups.values() {
+                let best = members
+                    .iter()
+                    .filter_map(|&idx| obs_for_blocking.get(idx).map(|o| (idx, o)))
+                    .min_by(|(_, a), (_, b)| {
+                        let keeper = Observation::prioritize_duplicate(a, b);
+                        if std::ptr::eq(keeper, *a) {
+                            std::cmp::Ordering::Less
+                        } else {
+                            std::cmp::Ordering::Greater
+                        }
+                    });
+                if let Some((idx, _)) = best {
+                    kept.push(idx);
+                }
+            }
+
+            kept.sort_by(|&a, &b| {
+                let ts_a = obs_data.get(a).map(|d| d.2);
+                let ts_b = obs_data.get(b).map(|d| d.2);
+                ts_b.cmp(&ts_a)
+            });
+
+            let deduped_count = obs_count.saturating_sub(kept.len());
+            if deduped_count > 0 {
+                tracing::debug!(
+                    original = obs_count,
+                    deduped = deduped_count,
+                    remaining = kept.len(),
+                    "Deduplicated context observations by embedding similarity"
+                );
+            }
+
+            kept
+        })
+        .await
+        .map_err(|e| ServiceError::System(anyhow::anyhow!("spawn_blocking failed: {}", e)))?;
+
+        let result: Vec<Observation> = kept_indices
+            .into_iter()
+            .filter_map(|idx| observations.get(idx).cloned())
+            .collect();
+
+        Ok(result)
+    }
+}

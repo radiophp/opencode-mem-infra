@@ -1,0 +1,59 @@
+//! Service layer for opencode-mem
+//!
+//! Centralizes business logic between HTTP/MCP handlers and storage/llm.
+
+#![allow(missing_docs, reason = "Internal crate with self-explanatory API")]
+#![allow(
+    clippy::missing_errors_doc,
+    reason = "Errors are self-explanatory from Result types"
+)]
+#![allow(
+    clippy::ref_patterns,
+    reason = "Ref patterns are clearer in some contexts"
+)]
+#![allow(missing_debug_implementations, reason = "Internal types")]
+#![allow(clippy::manual_let_else, reason = "if let is clearer")]
+#![allow(clippy::let_underscore_untyped, reason = "Type is clear from context")]
+#![allow(
+    clippy::let_underscore_must_use,
+    reason = "Intentionally ignoring results"
+)]
+#![allow(let_underscore_drop, reason = "Intentionally dropping values")]
+#![allow(clippy::missing_docs_in_private_items, reason = "Internal crate")]
+#![allow(clippy::implicit_return, reason = "Implicit return is idiomatic Rust")]
+#![allow(clippy::question_mark_used, reason = "? operator is idiomatic Rust")]
+#![allow(
+    clippy::cognitive_complexity,
+    reason = "Complex async flows are inherent"
+)]
+#![allow(clippy::min_ident_chars, reason = "Short error vars are idiomatic")]
+
+pub mod error;
+mod infinite_memory_service;
+mod knowledge_service;
+pub mod maintenance;
+mod observation_service;
+mod pending_write_queue;
+mod queue_service;
+mod search_service;
+mod session_service;
+
+pub use error::ServiceError;
+pub use infinite_memory_service::InfiniteMemoryService;
+pub use infinite_memory_service::init_compression_config;
+pub use knowledge_service::KnowledgeService;
+pub use observation_service::{ObservationService, SaveMemoryResult};
+pub use pending_write_queue::{PendingWrite, PendingWriteQueue, spawn_pending_flush};
+pub use queue_service::{QueueService, QueueToolCallResult};
+pub use search_service::SearchService;
+pub use session_service::SessionService;
+
+// Re-export storage types used by HTTP handlers so they don't need direct storage dependency.
+pub use opencode_mem_storage::{
+    PaginatedResult, PendingMessage, QueueStats, StorageStats, default_visibility_timeout_secs,
+};
+
+// Re-export core infinite memory types for convenience.
+pub use opencode_mem_core::{
+    InfiniteSummary, RawInfiniteEvent, StoredInfiniteEvent, SummaryEntities, tool_event,
+};

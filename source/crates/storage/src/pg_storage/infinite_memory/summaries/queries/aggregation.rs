@@ -1,0 +1,224 @@
+use super::super::{SummaryRow, row_to_summary};
+use crate::StorageError;
+use opencode_mem_core::InfiniteSummary;
+use sqlx::PgPool;
+
+pub async fn get_unaggregated_5min_summaries(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<InfiniteSummary>, StorageError> {
+    let rows = sqlx::query_as::<_, SummaryRow>(&format!(
+        "SELECT {} FROM summaries_5min \
+         WHERE summary_hour_id IS NULL \
+         ORDER BY ts_start ASC \
+         LIMIT $1",
+        crate::pg_storage::INFINITE_SUMMARY_COLUMNS
+    ))
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(row_to_summary).collect())
+}
+
+pub async fn get_sessions_with_unaggregated_5min(
+    pool: &PgPool,
+) -> Result<Vec<Option<String>>, StorageError> {
+    let rows: Vec<(Option<String>,)> = sqlx::query_as(
+        r#"
+        SELECT DISTINCT session_id
+        FROM summaries_5min
+        WHERE summary_hour_id IS NULL
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(|(sid,)| sid).collect())
+}
+
+pub async fn release_summaries_5min(
+    pool: &PgPool,
+    ids: &[i64],
+    increment_retry: bool,
+) -> Result<(), StorageError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        "UPDATE summaries_5min \
+         SET processing_started_at = CASE WHEN $2 THEN NOW() ELSE NULL END, \
+             processing_instance_id = NULL, \
+             retry_count = CASE WHEN $2 THEN retry_count + 1 ELSE retry_count END \
+         WHERE id = ANY($1)",
+    )
+    .bind(ids)
+    .bind(increment_retry)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn release_summaries_hour(
+    pool: &PgPool,
+    ids: &[i64],
+    increment_retry: bool,
+) -> Result<(), StorageError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        "UPDATE summaries_hour \
+         SET processing_started_at = CASE WHEN $2 THEN NOW() ELSE NULL END, \
+             processing_instance_id = NULL, \
+             retry_count = CASE WHEN $2 THEN retry_count + 1 ELSE retry_count END \
+         WHERE id = ANY($1)",
+    )
+    .bind(ids)
+    .bind(increment_retry)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn get_unaggregated_5min_for_session(
+    pool: &PgPool,
+    session_id: Option<&str>,
+) -> Result<Vec<InfiniteSummary>, StorageError> {
+    let instance_id = uuid::Uuid::new_v4().to_string();
+
+    let rows = if let Some(sid) = session_id {
+        sqlx::query_as::<_, SummaryRow>(&format!(
+            "UPDATE summaries_5min \
+            SET processing_started_at = NOW(), \
+                processing_instance_id = $2 \
+            WHERE id IN ( \
+                SELECT id \
+                FROM summaries_5min \
+                WHERE summary_hour_id IS NULL AND session_id = $1 \
+                  AND retry_count < 3 \
+                  AND (processing_started_at IS NULL OR processing_started_at < NOW() - INTERVAL '5 minutes') \
+                ORDER BY ts_start ASC \
+                LIMIT 500 \
+                FOR UPDATE SKIP LOCKED \
+            ) \
+            RETURNING {}",
+            crate::pg_storage::INFINITE_SUMMARY_COLUMNS
+        ))
+        .bind(sid)
+        .bind(&instance_id)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as::<_, SummaryRow>(&format!(
+            "UPDATE summaries_5min \
+            SET processing_started_at = NOW(), \
+                processing_instance_id = $1 \
+            WHERE id IN ( \
+                SELECT id \
+                FROM summaries_5min \
+                WHERE summary_hour_id IS NULL AND session_id IS NULL \
+                  AND retry_count < 3 \
+                  AND (processing_started_at IS NULL OR processing_started_at < NOW() - INTERVAL '5 minutes') \
+                ORDER BY ts_start ASC \
+                LIMIT 500 \
+                FOR UPDATE SKIP LOCKED \
+            ) \
+            RETURNING {}",
+            crate::pg_storage::INFINITE_SUMMARY_COLUMNS
+        ))
+        .bind(&instance_id)
+        .fetch_all(pool)
+        .await?
+    };
+
+    Ok(rows.into_iter().map(row_to_summary).collect())
+}
+
+pub async fn get_unaggregated_hour_summaries(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<InfiniteSummary>, StorageError> {
+    let rows = sqlx::query_as::<_, SummaryRow>(&format!(
+        "SELECT {} FROM summaries_hour \
+         WHERE summary_day_id IS NULL \
+         ORDER BY ts_start ASC \
+         LIMIT $1",
+        crate::pg_storage::INFINITE_SUMMARY_COLUMNS
+    ))
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(row_to_summary).collect())
+}
+
+pub async fn get_sessions_with_unaggregated_hour(
+    pool: &PgPool,
+) -> Result<Vec<Option<String>>, StorageError> {
+    let rows: Vec<(Option<String>,)> = sqlx::query_as(
+        r#"
+        SELECT DISTINCT session_id
+        FROM summaries_hour
+        WHERE summary_day_id IS NULL
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(|(sid,)| sid).collect())
+}
+
+pub async fn get_unaggregated_hour_for_session(
+    pool: &PgPool,
+    session_id: Option<&str>,
+) -> Result<Vec<InfiniteSummary>, StorageError> {
+    let instance_id = uuid::Uuid::new_v4().to_string();
+
+    let rows = if let Some(sid) = session_id {
+        sqlx::query_as::<_, SummaryRow>(&format!(
+            "UPDATE summaries_hour \
+            SET processing_started_at = NOW(), \
+                processing_instance_id = $2 \
+            WHERE id IN ( \
+                SELECT id \
+                FROM summaries_hour \
+                WHERE summary_day_id IS NULL AND session_id = $1 \
+                  AND retry_count < 3 \
+                  AND (processing_started_at IS NULL OR processing_started_at < NOW() - INTERVAL '5 minutes') \
+                ORDER BY ts_start ASC \
+                LIMIT 500 \
+                FOR UPDATE SKIP LOCKED \
+            ) \
+            RETURNING {}",
+            crate::pg_storage::INFINITE_SUMMARY_COLUMNS
+        ))
+        .bind(sid)
+        .bind(&instance_id)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as::<_, SummaryRow>(&format!(
+            "UPDATE summaries_hour \
+            SET processing_started_at = NOW(), \
+                processing_instance_id = $1 \
+            WHERE id IN ( \
+                SELECT id \
+                FROM summaries_hour \
+                WHERE summary_day_id IS NULL AND session_id IS NULL \
+                  AND retry_count < 3 \
+                  AND (processing_started_at IS NULL OR processing_started_at < NOW() - INTERVAL '5 minutes') \
+                ORDER BY ts_start ASC \
+                LIMIT 500 \
+                FOR UPDATE SKIP LOCKED \
+            ) \
+            RETURNING {}",
+            crate::pg_storage::INFINITE_SUMMARY_COLUMNS
+        ))
+        .bind(&instance_id)
+        .fetch_all(pool)
+        .await?
+    };
+
+    Ok(rows.into_iter().map(row_to_summary).collect())
+}

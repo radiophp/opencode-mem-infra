@@ -1,0 +1,30 @@
+[package]
+name = "opencode-mem-http"
+version.workspace = true
+edition.workspace = true
+description = "Axum HTTP API server with SSE real-time updates"
+keywords = ["http", "memory", "opencode", "mcp"]
+categories = ["web-programming"]
+homepage = "https://github.com/Stranmor/opencode-mem"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+opencode-mem-core = { workspace = true }
+opencode-mem-service = { workspace = true }
+opencode-mem-storage = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+async-stream = { workspace = true }
+futures-util = { workspace = true }
+chrono = { workspace = true }
+subtle = "2.6.1"

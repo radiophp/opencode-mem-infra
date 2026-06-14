@@ -1,0 +1,47 @@
+[package]
+name = "opencode-mem-cli"
+version.workspace = true
+edition.workspace = true
+description = "CLI binary for opencode-mem server and tools"
+keywords = ["cli", "memory", "opencode", "mcp", "ai"]
+categories = ["command-line-utilities"]
+homepage = "https://github.com/Stranmor/opencode-mem"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "opencode-mem"
+path = "src/main.rs"
+
+[features]
+cuda = ["opencode-mem-embeddings/cuda"]
+
+[dependencies]
+opencode-mem-core = { workspace = true }
+opencode-mem-storage = { workspace = true }
+opencode-mem-llm = { workspace = true }
+opencode-mem-http = { workspace = true }
+opencode-mem-mcp = { workspace = true }
+opencode-mem-embeddings = { workspace = true }
+opencode-mem-service = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+regex = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
+sqlx = { workspace = true, features = ["postgres"] }
+socket2 = "0.6.2"
+
+[dev-dependencies]
+assert_cmd = "2.1.2"
+predicates = "3.1.4"
